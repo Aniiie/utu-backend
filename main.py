@@ -20,7 +20,6 @@ LOGIN_URL = "https://online.uktech.ac.in/ums/Student/Public/ViewDetail"
 CAPTCHA_URL = "https://online.uktech.ac.in/ums/Student/Master/GetCaptchaimage"
 ATTENDANCE_PAGE_URL = "https://online.uktech.ac.in/ums/Student/User/ViewAttendance"
 ATTENDANCE_API_URL = "https://online.uktech.ac.in/ums/Student/User/ShowStudentAttendanceListByRollNoDOB"
-STUDENT_INFO_API = "https://online.uktech.ac.in/ums/Student/User/GetStudentDetailByRollNoDOB"
 
 session_clients: dict = {}
 
@@ -77,83 +76,78 @@ async def get_attendance(data: AttendanceRequest):
         if login_soup.find("input", {"name": "txtCaptcha"}):
             raise HTTPException(status_code=401, detail="Wrong credentials or captcha. Try again.")
 
-        # Step 2: Load attendance page and extract correct IDs from JS
+        # Step 2: Load attendance page
         att_page = await client.get(ATTENDANCE_PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
         page_text = att_page.text
+        att_soup = BeautifulSoup(page_text, "html.parser")
 
-        # The correct IDs are embedded in JavaScript function calls on the page
-        # Look for patterns like: GetCourseBranchDurationForAttendance?BranchId=1&CourseId=1
-        # and StudentAdmissionId in the page JS
-
+        # Find StudentAdmissionId — it's in a hidden input with id containing "admission"
+        admission_id = ""
         college_id = "61"
         course_id = "1"
         branch_id = "1"
         duration_id = "2"
-        admission_id = ""
         student_name = ""
 
-        # Search for StudentAdmissionId in page JS
-        patterns = [
-            r'StudentAdmissionId["\s]*[:=]["\s]*["\']?(\d+)',
-            r'admissionId["\s]*[:=]["\s]*["\']?(\d+)',
-            r'AdmissionId["\s]*[:=]["\s]*["\']?(\d+)',
-            r'"StudentAdmissionId"\s*:\s*(\d+)',
-            r"'StudentAdmissionId'\s*:\s*(\d+)",
-        ]
-        for p in patterns:
-            m = re.search(p, page_text, re.IGNORECASE)
-            if m:
-                admission_id = m.group(1)
-                break
+        # Search ALL hidden inputs
+        for inp in att_soup.find_all("input", {"type": "hidden"}):
+            inp_id = (inp.get("id") or "").lower()
+            inp_name = (inp.get("name") or "").lower()
+            val = inp.get("value", "")
+            if not val:
+                continue
+            if "admission" in inp_id or "admission" in inp_name:
+                admission_id = val
+            elif "collegeid" in inp_id or "collegeid" in inp_name:
+                college_id = val
+            elif "courseid" in inp_id or "courseid" in inp_name:
+                if "branch" not in inp_id:
+                    course_id = val
+            elif "branchid" in inp_id or "branchid" in inp_name:
+                if "duration" not in inp_id:
+                    branch_id = val
+            elif "duration" in inp_id or "duration" in inp_name:
+                duration_id = val
 
-        # Search for CollegeId
-        for p in [r'"CollegeId"\s*:\s*(\d+)', r"CollegeId\s*=\s*(\d+)", r'CollegeId["\s]*[:=]["\s]*(\d+)']:
-            m = re.search(p, page_text, re.IGNORECASE)
-            if m and m.group(1) != "0":
-                college_id = m.group(1)
-                break
+        # Also search in ALL inputs (not just hidden)
+        if not admission_id:
+            for inp in att_soup.find_all("input"):
+                inp_id = (inp.get("id") or "").lower()
+                val = inp.get("value", "")
+                if "admission" in inp_id and val:
+                    admission_id = val
+                    break
 
-        # Search for CourseBranchDurationId
-        for p in [r'"CourseBranchDurationId"\s*:\s*(\d+)', r'CourseBranchDurationId\s*=\s*(\d+)', r'DurationId["\s]*[:=]["\s]*(\d+)']:
-            m = re.search(p, page_text, re.IGNORECASE)
-            if m and m.group(1) != "0":
-                duration_id = m.group(1)
-                break
+        # Search in page source for the value
+        if not admission_id:
+            patterns = [
+                r'id=["\'].*?admission.*?["\'][^>]*value=["\'](\d+)["\']',
+                r'value=["\'](\d+)["\'][^>]*id=["\'].*?admission.*?["\']',
+                r'admission.*?value.*?["\'](\d+)["\']',
+                r'"admission"\s*:\s*"?(\d+)"?',
+                r"admission.*?=.*?'(\d+)'",
+                r'admission.*?=.*?"(\d+)"',
+            ]
+            for p in patterns:
+                m = re.search(p, page_text, re.IGNORECASE)
+                if m:
+                    admission_id = m.group(1)
+                    break
 
-        # Get student name from table
-        att_soup = BeautifulSoup(page_text, "html.parser")
+        # Get student name
         for td in att_soup.find_all("td"):
             text = td.get_text(strip=True)
-            if text and len(text) > 5 and text.replace(" ", "").isalpha() and text.isupper():
+            if text and len(text) > 5 and text.replace(" ","").isalpha() and text.isupper() and len(text.split()) >= 2:
                 student_name = text
                 break
 
-        # Step 3: If still no admission_id, try the student detail API
         if not admission_id:
-            detail_resp = await client.get(
-                STUDENT_INFO_API,
-                params={"RollNo": data.roll_no, "DOB": data.dob},
-                headers={"User-Agent": "Mozilla/5.0", "Referer": ATTENDANCE_PAGE_URL,
-                        "X-Requested-With": "XMLHttpRequest"}
-            )
-            if detail_resp.status_code == 200:
-                try:
-                    detail = detail_resp.json()
-                    if isinstance(detail, list) and detail:
-                        detail = detail[0]
-                    admission_id = str(detail.get("StudentAdmissionId") or detail.get("admissionId") or "")
-                    college_id = str(detail.get("CollegeId") or college_id)
-                    course_id = str(detail.get("CourseId") or course_id)
-                    branch_id = str(detail.get("BranchId") or branch_id)
-                    duration_id = str(detail.get("CourseBranchDurationId") or duration_id)
-                    student_name = detail.get("StudentName") or student_name
-                except:
-                    pass
+            # Return all hidden input ids for debugging
+            all_ids = [(inp.get("id",""), inp.get("name",""), inp.get("value","")) 
+                      for inp in att_soup.find_all("input", {"type": "hidden"})]
+            raise HTTPException(status_code=404, detail=f"Cannot find AdmissionId. Hidden inputs: {all_ids[:10]}")
 
-        if not admission_id:
-            raise HTTPException(status_code=404, detail="Could not find StudentAdmissionId. Please contact support.")
-
-        # Step 4: Call attendance API
+        # Step 3: Call attendance API
         params = {
             "CollegeId": college_id,
             "CourseId": course_id,
@@ -175,7 +169,7 @@ async def get_attendance(data: AttendanceRequest):
 
         if att_resp.status_code != 200:
             raise HTTPException(status_code=att_resp.status_code,
-                detail=f"API error {att_resp.status_code}. IDs: college={college_id}, course={course_id}, branch={branch_id}, admission={admission_id}, duration={duration_id}")
+                detail=f"API {att_resp.status_code}. IDs: college={college_id},course={course_id},branch={branch_id},admission={admission_id},duration={duration_id}")
 
         try:
             att_data = att_resp.json()
@@ -185,7 +179,7 @@ async def get_attendance(data: AttendanceRequest):
         if not att_data:
             raise HTTPException(status_code=404, detail="No attendance data for this month.")
 
-        # Step 5: Parse
+        # Parse JSON
         subject_map = {}
         for item in att_data:
             subject = (item.get("PaperName") or item.get("SubjectName") or
@@ -211,7 +205,7 @@ async def get_attendance(data: AttendanceRequest):
 
         if not subjects:
             sample = att_data[0] if att_data else {}
-            raise HTTPException(status_code=404, detail=f"Could not parse. Keys: {list(sample.keys())}")
+            raise HTTPException(status_code=404, detail=f"Keys found: {list(sample.keys())}")
 
     session_clients.pop(data.session_id, None)
     return {"name": student_name, "roll_no": data.roll_no, "subjects": subjects}
