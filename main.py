@@ -20,6 +20,7 @@ LOGIN_URL = "https://online.uktech.ac.in/ums/Student/Public/ViewDetail"
 CAPTCHA_URL = "https://online.uktech.ac.in/ums/Student/Master/GetCaptchaimage"
 ATTENDANCE_PAGE_URL = "https://online.uktech.ac.in/ums/Student/User/ViewAttendance"
 ATTENDANCE_API_URL = "https://online.uktech.ac.in/ums/Student/User/ShowStudentAttendanceListByRollNoDOB"
+STUDENT_INFO_API = "https://online.uktech.ac.in/ums/Student/User/GetStudentDetailByRollNoDOB"
 
 session_clients: dict = {}
 
@@ -61,7 +62,7 @@ async def get_attendance(data: AttendanceRequest):
     now = datetime.now()
     month_id = now.month
     year = now.year
-    session_year = year - 1  # 2025 for session 2025-26
+    session_year = year - 1
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         for k, v in session["cookies"].items():
@@ -76,49 +77,83 @@ async def get_attendance(data: AttendanceRequest):
         if login_soup.find("input", {"name": "txtCaptcha"}):
             raise HTTPException(status_code=401, detail="Wrong credentials or captcha. Try again.")
 
-        # Step 2: Load attendance page and extract IDs from JavaScript
+        # Step 2: Load attendance page and extract correct IDs from JS
         att_page = await client.get(ATTENDANCE_PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
         page_text = att_page.text
 
-        # Extract IDs from JS variables in page source
-        def extract_js_var(text, var_name):
-            patterns = [
-                rf'var\s+{var_name}\s*=\s*["\']?(\d+)["\']?',
-                rf'{var_name}\s*=\s*["\']?(\d+)["\']?',
-                rf'["\'{var_name}["\']\s*:\s*["\']?(\d+)["\']?',
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    return match.group(1)
-            return None
+        # The correct IDs are embedded in JavaScript function calls on the page
+        # Look for patterns like: GetCourseBranchDurationForAttendance?BranchId=1&CourseId=1
+        # and StudentAdmissionId in the page JS
 
-        # Try to find IDs in page source
-        college_id = extract_js_var(page_text, "CollegeId") or extract_js_var(page_text, "collegeId") or "61"
-        course_id = extract_js_var(page_text, "CourseId") or extract_js_var(page_text, "courseId") or "1"
-        branch_id = extract_js_var(page_text, "BranchId") or extract_js_var(page_text, "branchId") or "1"
-        admission_id = extract_js_var(page_text, "StudentAdmissionId") or extract_js_var(page_text, "admissionId") or ""
-        duration_id = extract_js_var(page_text, "CourseBranchDurationId") or extract_js_var(page_text, "durationId") or "2"
+        college_id = "61"
+        course_id = "1"
+        branch_id = "1"
+        duration_id = "2"
+        admission_id = ""
+        student_name = ""
 
-        # Also check hidden inputs
+        # Search for StudentAdmissionId in page JS
+        patterns = [
+            r'StudentAdmissionId["\s]*[:=]["\s]*["\']?(\d+)',
+            r'admissionId["\s]*[:=]["\s]*["\']?(\d+)',
+            r'AdmissionId["\s]*[:=]["\s]*["\']?(\d+)',
+            r'"StudentAdmissionId"\s*:\s*(\d+)',
+            r"'StudentAdmissionId'\s*:\s*(\d+)",
+        ]
+        for p in patterns:
+            m = re.search(p, page_text, re.IGNORECASE)
+            if m:
+                admission_id = m.group(1)
+                break
+
+        # Search for CollegeId
+        for p in [r'"CollegeId"\s*:\s*(\d+)', r"CollegeId\s*=\s*(\d+)", r'CollegeId["\s]*[:=]["\s]*(\d+)']:
+            m = re.search(p, page_text, re.IGNORECASE)
+            if m and m.group(1) != "0":
+                college_id = m.group(1)
+                break
+
+        # Search for CourseBranchDurationId
+        for p in [r'"CourseBranchDurationId"\s*:\s*(\d+)', r'CourseBranchDurationId\s*=\s*(\d+)', r'DurationId["\s]*[:=]["\s]*(\d+)']:
+            m = re.search(p, page_text, re.IGNORECASE)
+            if m and m.group(1) != "0":
+                duration_id = m.group(1)
+                break
+
+        # Get student name from table
         att_soup = BeautifulSoup(page_text, "html.parser")
-        for inp in att_soup.find_all("input", {"type": "hidden"}):
-            name = inp.get("name", "").lower()
-            val = inp.get("value", "")
-            if not val:
-                continue
-            if "collegeid" in name:
-                college_id = val
-            elif "courseid" in name and "branch" not in name:
-                course_id = val
-            elif "branchid" in name and "duration" not in name:
-                branch_id = val
-            elif "admissionid" in name or "studentadmission" in name:
-                admission_id = val
-            elif "duration" in name:
-                duration_id = val
+        for td in att_soup.find_all("td"):
+            text = td.get_text(strip=True)
+            if text and len(text) > 5 and text.replace(" ", "").isalpha() and text.isupper():
+                student_name = text
+                break
 
-        # Step 3: Call attendance JSON API
+        # Step 3: If still no admission_id, try the student detail API
+        if not admission_id:
+            detail_resp = await client.get(
+                STUDENT_INFO_API,
+                params={"RollNo": data.roll_no, "DOB": data.dob},
+                headers={"User-Agent": "Mozilla/5.0", "Referer": ATTENDANCE_PAGE_URL,
+                        "X-Requested-With": "XMLHttpRequest"}
+            )
+            if detail_resp.status_code == 200:
+                try:
+                    detail = detail_resp.json()
+                    if isinstance(detail, list) and detail:
+                        detail = detail[0]
+                    admission_id = str(detail.get("StudentAdmissionId") or detail.get("admissionId") or "")
+                    college_id = str(detail.get("CollegeId") or college_id)
+                    course_id = str(detail.get("CourseId") or course_id)
+                    branch_id = str(detail.get("BranchId") or branch_id)
+                    duration_id = str(detail.get("CourseBranchDurationId") or duration_id)
+                    student_name = detail.get("StudentName") or student_name
+                except:
+                    pass
+
+        if not admission_id:
+            raise HTTPException(status_code=404, detail="Could not find StudentAdmissionId. Please contact support.")
+
+        # Step 4: Call attendance API
         params = {
             "CollegeId": college_id,
             "CourseId": course_id,
@@ -138,11 +173,9 @@ async def get_attendance(data: AttendanceRequest):
             "X-Requested-With": "XMLHttpRequest"
         })
 
-        if att_resp.status_code == 401:
-            raise HTTPException(status_code=401, detail=f"API auth failed. IDs found: college={college_id}, course={course_id}, branch={branch_id}, admission={admission_id}, duration={duration_id}")
-
         if att_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Attendance API error: {att_resp.status_code}")
+            raise HTTPException(status_code=att_resp.status_code,
+                detail=f"API error {att_resp.status_code}. IDs: college={college_id}, course={course_id}, branch={branch_id}, admission={admission_id}, duration={duration_id}")
 
         try:
             att_data = att_resp.json()
@@ -150,44 +183,38 @@ async def get_attendance(data: AttendanceRequest):
             raise HTTPException(status_code=502, detail="Could not parse attendance response.")
 
         if not att_data:
-            raise HTTPException(status_code=404, detail="No attendance data. Try a different month.")
+            raise HTTPException(status_code=404, detail="No attendance data for this month.")
 
-        # Step 4: Parse JSON
+        # Step 5: Parse
         subject_map = {}
         for item in att_data:
-            # Try all possible key names
-            subject = (item.get("PaperName") or item.get("SubjectName") or 
+            subject = (item.get("PaperName") or item.get("SubjectName") or
                       item.get("paperName") or item.get("subjectName") or "")
             held = int(item.get("TotalClassesHeld") or item.get("totalClassesHeld") or 0)
             attended = int(item.get("TotalClassesAttended") or item.get("totalClassesAttended") or 0)
-
-            if subject:
-                if subject not in subject_map:
-                    subject_map[subject] = {"held": 0, "attended": 0}
-                if held > subject_map[subject]["held"]:
-                    subject_map[subject]["held"] = held
-                    subject_map[subject]["attended"] = attended
+            if subject and held > 0:
+                if subject not in subject_map or held > subject_map[subject]["held"]:
+                    subject_map[subject] = {"held": held, "attended": attended}
 
         subjects = []
         for subj, vals in subject_map.items():
             total = vals["held"]
             present = vals["attended"]
-            if total > 0:
-                pct = round((present / total) * 100, 1)
-                subjects.append({
-                    "subject": subj,
-                    "present": present,
-                    "total": total,
-                    "percentage": pct,
-                    "safe": pct >= 75,
-                })
+            pct = round((present / total) * 100, 1)
+            subjects.append({
+                "subject": subj,
+                "present": present,
+                "total": total,
+                "percentage": pct,
+                "safe": pct >= 75,
+            })
 
         if not subjects:
             sample = att_data[0] if att_data else {}
-            raise HTTPException(status_code=404, detail=f"Could not parse. Sample keys: {list(sample.keys())}")
+            raise HTTPException(status_code=404, detail=f"Could not parse. Keys: {list(sample.keys())}")
 
     session_clients.pop(data.session_id, None)
-    return {"name": "", "roll_no": data.roll_no, "subjects": subjects}
+    return {"name": student_name, "roll_no": data.roll_no, "subjects": subjects}
 
 @app.get("/health")
 def health():
