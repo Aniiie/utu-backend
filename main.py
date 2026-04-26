@@ -21,6 +21,15 @@ CAPTCHA_URL = "https://online.uktech.ac.in/ums/Student/Master/GetCaptchaimage"
 ATTENDANCE_PAGE_URL = "https://online.uktech.ac.in/ums/Student/User/ViewAttendance"
 ATTENDANCE_API_URL = "https://online.uktech.ac.in/ums/Student/User/ShowStudentAttendanceListByRollNoDOB"
 
+# Try multiple student info endpoints
+STUDENT_INFO_URLS = [
+    "https://online.uktech.ac.in/ums/Student/User/GetStudentInfo",
+    "https://online.uktech.ac.in/ums/Student/User/GetStudentDetailByRollNo",
+    "https://online.uktech.ac.in/ums/Student/User/GetStudentDetail",
+    "https://online.uktech.ac.in/ums/Student/Public/GetStudentByRollNoDOB",
+    "https://online.uktech.ac.in/ums/Student/User/GetStudentAdmissionDetail",
+]
+
 session_clients: dict = {}
 
 @app.get("/captcha")
@@ -76,12 +85,7 @@ async def get_attendance(data: AttendanceRequest):
         if login_soup.find("input", {"name": "txtCaptcha"}):
             raise HTTPException(status_code=401, detail="Wrong credentials or captcha. Try again.")
 
-        # Step 2: Load attendance page
-        att_page = await client.get(ATTENDANCE_PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
-        page_text = att_page.text
-        att_soup = BeautifulSoup(page_text, "html.parser")
-
-        # Find StudentAdmissionId — it's in a hidden input with id containing "admission"
+        # Step 2: Try to get student info from various APIs
         admission_id = ""
         college_id = "61"
         course_id = "1"
@@ -89,65 +93,73 @@ async def get_attendance(data: AttendanceRequest):
         duration_id = "2"
         student_name = ""
 
-        # Search ALL hidden inputs
-        for inp in att_soup.find_all("input", {"type": "hidden"}):
-            inp_id = (inp.get("id") or "").lower()
-            inp_name = (inp.get("name") or "").lower()
-            val = inp.get("value", "")
-            if not val:
-                continue
-            if "admission" in inp_id or "admission" in inp_name:
-                admission_id = val
-            elif "collegeid" in inp_id or "collegeid" in inp_name:
-                college_id = val
-            elif "courseid" in inp_id or "courseid" in inp_name:
-                if "branch" not in inp_id:
-                    course_id = val
-            elif "branchid" in inp_id or "branchid" in inp_name:
-                if "duration" not in inp_id:
-                    branch_id = val
-            elif "duration" in inp_id or "duration" in inp_name:
-                duration_id = val
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": ATTENDANCE_PAGE_URL,
+            "X-Requested-With": "XMLHttpRequest"
+        }
 
-        # Also search in ALL inputs (not just hidden)
-        if not admission_id:
-            for inp in att_soup.find_all("input"):
-                inp_id = (inp.get("id") or "").lower()
-                val = inp.get("value", "")
-                if "admission" in inp_id and val:
-                    admission_id = val
-                    break
+        # Try each student info URL
+        for url in STUDENT_INFO_URLS:
+            for params in [
+                {"RollNo": data.roll_no, "DOB": data.dob},
+                {"rollNo": data.roll_no, "dob": data.dob},
+                {"RollNo": data.roll_no},
+            ]:
+                try:
+                    r = await client.get(url, params=params, headers=headers)
+                    if r.status_code == 200 and r.text and r.text != "null":
+                        d = r.json()
+                        if isinstance(d, list) and d:
+                            d = d[0]
+                        if isinstance(d, dict):
+                            aid = (d.get("StudentAdmissionId") or d.get("AdmissionId") or 
+                                  d.get("admissionId") or d.get("studentAdmissionId"))
+                            if aid:
+                                admission_id = str(aid)
+                                college_id = str(d.get("CollegeId") or d.get("collegeId") or college_id)
+                                course_id = str(d.get("CourseId") or d.get("courseId") or course_id)
+                                branch_id = str(d.get("BranchId") or d.get("branchId") or branch_id)
+                                duration_id = str(d.get("CourseBranchDurationId") or duration_id)
+                                student_name = str(d.get("StudentName") or d.get("studentName") or "")
+                                break
+                except:
+                    continue
+            if admission_id:
+                break
 
-        # Search in page source for the value
+        # Step 3: If still no ID, try loading ViewDetail page which has student info
         if not admission_id:
+            detail_page = await client.get(
+                "https://online.uktech.ac.in/ums/Student/User/ViewDetail",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            detail_text = detail_page.text
+            
+            # Search for admission ID in page source
             patterns = [
-                r'id=["\'].*?admission.*?["\'][^>]*value=["\'](\d+)["\']',
-                r'value=["\'](\d+)["\'][^>]*id=["\'].*?admission.*?["\']',
-                r'admission.*?value.*?["\'](\d+)["\']',
-                r'"admission"\s*:\s*"?(\d+)"?',
-                r"admission.*?=.*?'(\d+)'",
-                r'admission.*?=.*?"(\d+)"',
+                r'StudentAdmissionId["\s:=\']+(\d+)',
+                r'AdmissionId["\s:=\']+(\d+)',
+                r'"Value"\s*:\s*(\d+).*?"Text"\s*:\s*"[^"]*admission',
+                r'hdnStudentAdmission[^>]*value=["\'](\d+)',
             ]
             for p in patterns:
-                m = re.search(p, page_text, re.IGNORECASE)
+                m = re.search(p, detail_text, re.IGNORECASE)
                 if m:
                     admission_id = m.group(1)
                     break
 
-        # Get student name
-        for td in att_soup.find_all("td"):
-            text = td.get_text(strip=True)
-            if text and len(text) > 5 and text.replace(" ","").isalpha() and text.isupper() and len(text.split()) >= 2:
-                student_name = text
-                break
+            # Also check the page URL after redirect - sometimes ID is in URL
+            if str(detail_page.url) != "https://online.uktech.ac.in/ums/Student/User/ViewDetail":
+                url_match = re.search(r'id=(\d+)', str(detail_page.url))
+                if url_match:
+                    admission_id = url_match.group(1)
 
         if not admission_id:
-            # Return all hidden input ids for debugging
-            all_ids = [(inp.get("id",""), inp.get("name",""), inp.get("value","")) 
-                      for inp in att_soup.find_all("input", {"type": "hidden"})]
-            raise HTTPException(status_code=404, detail=f"Cannot find AdmissionId. Hidden inputs: {all_ids[:10]}")
+            raise HTTPException(status_code=404, 
+                detail="Could not find StudentAdmissionId automatically. The portal uses JavaScript to load it.")
 
-        # Step 3: Call attendance API
+        # Step 4: Call attendance API
         params = {
             "CollegeId": college_id,
             "CourseId": course_id,
@@ -161,11 +173,7 @@ async def get_attendance(data: AttendanceRequest):
             "MonthId": str(month_id),
         }
 
-        att_resp = await client.get(ATTENDANCE_API_URL, params=params, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": ATTENDANCE_PAGE_URL,
-            "X-Requested-With": "XMLHttpRequest"
-        })
+        att_resp = await client.get(ATTENDANCE_API_URL, params=params, headers=headers)
 
         if att_resp.status_code != 200:
             raise HTTPException(status_code=att_resp.status_code,
@@ -179,7 +187,7 @@ async def get_attendance(data: AttendanceRequest):
         if not att_data:
             raise HTTPException(status_code=404, detail="No attendance data for this month.")
 
-        # Parse JSON
+        # Parse
         subject_map = {}
         for item in att_data:
             subject = (item.get("PaperName") or item.get("SubjectName") or
