@@ -5,7 +5,6 @@ from pydantic import BaseModel
 import httpx
 from bs4 import BeautifulSoup
 from datetime import datetime
-import re
 
 app = FastAPI(title="UTU Attendance API")
 
@@ -80,27 +79,28 @@ async def get_attendance(data: AttendanceRequest):
         att_page = await client.get(ATTENDANCE_PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
         att_soup = BeautifulSoup(att_page.text, "html.parser")
 
-        # Find exact hidden inputs by their known IDs
-        def get_hidden_val(soup, *ids):
-            for id_ in ids:
-                el = soup.find("input", {"id": id_})
+        # Search by NAME attribute (not id!)
+        # <input type="hidden" name="StudentAdmissionId" id="hdnStudentAdmissionId" value="47069">
+        def get_by_name(soup, *names):
+            for name in names:
+                el = soup.find("input", {"name": name})
                 if el and el.get("value"):
                     return el.get("value")
             return ""
 
-        admission_id = get_hidden_val(att_soup, "hdnStudentAdmissionId", "hdnAdmissionId")
-        college_id = get_hidden_val(att_soup, "hdnCollegeId", "hdnCollege") or "61"
-        course_id = get_hidden_val(att_soup, "hdnCourseId", "hdnCourse") or "1"
-        branch_id = get_hidden_val(att_soup, "hdnBranchId", "hdnBranch") or "1"
-        duration_id = get_hidden_val(att_soup, "hdnCourseBranchDurationId", "hdnDurationId") or "2"
-        student_name = get_hidden_val(att_soup, "hdnStudentName", "hdnName")
+        admission_id = get_by_name(att_soup, "StudentAdmissionId", "hdnStudentAdmissionId")
+        college_id = get_by_name(att_soup, "CollegeId", "hdnCollegeId") or "61"
+        course_id = get_by_name(att_soup, "CourseId", "hdnCourseId") or "1"
+        branch_id = get_by_name(att_soup, "BranchId", "hdnBranchId") or "1"
+        duration_id = get_by_name(att_soup, "CourseBranchDurationId", "hdnCourseBranchDurationId") or "2"
+        student_name = get_by_name(att_soup, "StudentName", "hdnStudentName")
 
-        # Debug: show all hidden input ids if not found
         if not admission_id:
-            all_hidden = [(inp.get("id",""), inp.get("value","")) 
-                         for inp in att_soup.find_all("input", {"type": "hidden"})]
-            raise HTTPException(status_code=404, 
-                detail=f"hdnStudentAdmissionId not found. All hidden: {all_hidden}")
+            # Debug: show all input names and values
+            all_inputs = [(inp.get("name",""), inp.get("id",""), inp.get("value",""))
+                         for inp in att_soup.find_all("input")]
+            raise HTTPException(status_code=404,
+                detail=f"StudentAdmissionId not found. Inputs: {all_inputs[:15]}")
 
         # Step 3: Call attendance API
         params = {
